@@ -91,7 +91,8 @@ func validateAlias(_ raw: String, excluding current: String? = nil) -> Result<St
     guard alias.range(of: "^[A-Za-z0-9][A-Za-z0-9_-]*$", options: .regularExpression) != nil else {
         return .failure("Alias: use only letters, digits, dashes and underscores.")
     }
-    if alias == "claude" || alias == "claude-accounts" { return .failure("\(alias) is reserved.") }
+    // claude-profiler would map to ~/.claude-profiler, where this app's source may live.
+    if ["claude", "claude-accounts", "claude-profiler", "profiler"].contains(alias) { return .failure("\(alias) is reserved.") }
     if alias != current, loadProfiles().contains(where: { $0.alias == alias }) { return .failure("\(alias) already exists.") }
     return .success(alias)
 }
