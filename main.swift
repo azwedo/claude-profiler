@@ -160,6 +160,7 @@ func keychainService(_ p: Profile) -> String {
 
 let idleMessage = "idle — run it to refresh usage"
 let signedOutMessage = "signed out"
+let rateLimitedMessage = "rate limited"
 
 func accessToken(_ p: Profile) -> Result<String, String> {
     let task = Process(), pipe = Pipe()
@@ -227,6 +228,7 @@ func fetchUsage(_ p: Profile, done: @escaping (UsageState) -> Void) {
             if let err { return done(.failed(err.localizedDescription)) }
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             if code == 401 { return done(.signedOut) }
+            if code == 429 { return done(.failed(rateLimitedMessage)) }
             guard code == 200, let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                 return done(.failed("Usage unavailable (HTTP \(code))"))
             }
@@ -385,7 +387,11 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
     var usage: [String: UsageState] = [:]   // keyed by profile dir
-    var lastFetch = Date.distantPast
+    // Per-profile schedule. The usage endpoint rate-limits per account (and Claude Code's own /usage
+    // shares that budget), so each profile is checked every 5 minutes and backs off after a 429.
+    var nextFetch: [String: Date] = [:]
+    var backoff: [String: TimeInterval] = [:]
+    let interval: TimeInterval = 300
     var menuOpen = false
     // Live rows while the menu is open, so a refresh updates them in place instead of rebuilding
     // the menu (which would close any submenu under the pointer).
@@ -411,12 +417,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
 
     func allProfiles() -> [Profile] { (showsDefault ? [defaultProfile] : []) + loadProfiles() }
 
+    // Runs every minute; fetches only the profiles that are due.
     func refreshUsage() {
-        lastFetch = Date()
         let profiles = allProfiles()
         let live = Set(profiles.map(\.dir))
         usage = usage.filter { live.contains($0.key) }
-        for p in profiles where p.email != nil {
+        let now = Date()
+        for p in profiles where p.email != nil && (nextFetch[p.dir] ?? .distantPast) <= now {
+            nextFetch[p.dir] = now + interval
             fetchUsage(p) { state in
                 DispatchQueue.main.async { self.apply(state, to: p) }
             }
@@ -424,6 +432,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     }
 
     func apply(_ state: UsageState, to p: Profile) {
+        var state = state
+        if case .failed(rateLimitedMessage) = state {
+            let wait = min((backoff[p.dir] ?? interval) * 2, 1800)
+            backoff[p.dir] = wait
+            nextFetch[p.dir] = Date() + wait
+            let f = DateFormatter()
+            f.dateFormat = "HH:mm"
+            state = .failed("usage paused, retrying at " + f.string(from: Date() + wait))
+        } else if case .loaded = state {
+            backoff[p.dir] = nil
+        }
         // A failed refresh keeps the last good numbers instead of wiping them.
         if case .failed(let msg) = state, msg != idleMessage, case .loaded? = usage[p.dir] { return }
         checkAlerts(p, state)
@@ -470,7 +489,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
 
     func menuWillOpen(_ menu: NSMenu) {
         menuOpen = true
-        if Date().timeIntervalSince(lastFetch) > 30 { refreshUsage() }
     }
 
     func menuDidClose(_ menu: NSMenu) { menuOpen = false }

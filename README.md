@@ -12,7 +12,7 @@ claude-personal  # signed in as you@gmail.com
 ## Features
 
 - **Profiles from the menu bar**: add, edit, copy or remove profiles without touching `~/.zshrc` by hand.
-- **Live usage**: session and weekly limits for every signed-in profile, the same numbers `/usage` shows, refreshed every minute.
+- **Live usage**: session and weekly limits for every signed-in profile, the same numbers `/usage` shows, checked every 5 minutes per account, backing off if the service rate-limits.
 - **Colour-coded status**: green, orange or red dot per profile, with usage bars in each profile's submenu.
 - **Notifications**: when a limit passes 80%, hits 100%, or resets, and when a profile gets signed out.
 - **One-click login**: Log In opens a terminal tab (Warp or Terminal) running `claude auth login` for that profile.
