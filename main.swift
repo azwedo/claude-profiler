@@ -392,6 +392,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     var nextFetch: [String: Date] = [:]
     var backoff: [String: TimeInterval] = [:]
     let interval: TimeInterval = 300
+    var lastManualRefresh = Date.distantPast
     var menuOpen = false
     // Live rows while the menu is open, so a refresh updates them in place instead of rebuilding
     // the menu (which would close any submenu under the pointer).
@@ -508,6 +509,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         menu.removeAllItems()
         menu.addItem(headerItem())
         menu.addItem(.separator())
+        // Manual refresh, at most once a minute so it can't trip the rate limit on its own.
+        let wait = Int(60 - Date().timeIntervalSince(lastManualRefresh))
+        let refresh = action(wait > 0 ? "Refresh (available in \(wait)s)" : "Refresh", #selector(refreshNow), nil)
+        refresh.isEnabled = wait <= 0
+        menu.autoenablesItems = false
+        menu.addItem(refresh)
         menu.addItem(action("Add Profile", #selector(add), nil))
         let config = NSMenu()
         for s in settings { config.addItem(checkboxItem(s.title, key: s.key)) }
@@ -620,6 +627,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     }
 
     func fail(_ msg: String) { let e = NSAlert(); e.messageText = "Claude Profiler"; e.informativeText = msg; e.runModal() }
+
+    @objc func refreshNow(_ s: NSMenuItem) {
+        lastManualRefresh = Date()
+        nextFetch = [:]
+        refreshUsage()
+    }
 
     @objc func toggleSetting(_ box: NSButton) {
         guard let key = box.identifier?.rawValue else { return }
