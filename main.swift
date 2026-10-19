@@ -517,15 +517,19 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         menu.addItem(refresh)
         menu.addItem(action("Add Profile", #selector(add), nil))
         let config = NSMenu()
-        for s in settings { config.addItem(checkboxItem(s.title, key: s.key)) }
+        for s in settings {
+            let i = action(s.title, #selector(toggleSetting), s.key)
+            i.state = setting(s.key) ? .on : .off
+            config.addItem(i)
+        }
         let configItem = NSMenuItem(title: "Configuration", action: nil, keyEquivalent: "")
         configItem.submenu = config
         menu.addItem(configItem)
         insertRows()
     }
 
-    // Profile rows sit between the header and the first separator. Swapping just them keeps the
-    // Configuration submenu open while its checkboxes change what the list shows.
+    // Profile rows sit between the header and the first separator, so a usage refresh can swap
+    // just them without closing an open submenu.
     func insertRows() {
         for (row, _) in rows.values where menu.index(of: row) >= 0 { menu.removeItem(row) }
         rows = [:]
@@ -556,22 +560,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             menu.insertItem(row, at: index)
             index += 1
         }
-    }
-
-    // A checkbox drawn inside the menu: clicking a view-based item doesn't close the menu,
-    // so several options can be changed in one go.
-    func checkboxItem(_ title: String, key: String) -> NSMenuItem {
-        let box = NSButton(checkboxWithTitle: title, target: self, action: #selector(toggleSetting))
-        box.identifier = NSUserInterfaceItemIdentifier(key)
-        box.state = setting(key) ? .on : .off
-        box.font = NSFont.menuFont(ofSize: 0)
-        box.sizeToFit()
-        let view = NSView(frame: NSRect(x: 0, y: 0, width: box.frame.width + 28, height: box.frame.height + 8))
-        box.frame.origin = NSPoint(x: 14, y: 4)
-        view.addSubview(box)
-        let item = NSMenuItem()
-        item.view = view
-        return item
     }
 
     // Sets a row's status line and dot, and refills its submenu (the same NSMenu, so an open one stays open).
@@ -634,10 +622,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         refreshUsage()
     }
 
-    @objc func toggleSetting(_ box: NSButton) {
-        guard let key = box.identifier?.rawValue else { return }
-        setSetting(key, box.state == .on)
-        insertRows()
+    @objc func toggleSetting(_ s: NSMenuItem) {
+        let key = s.representedObject as! String
+        setSetting(key, !setting(key))
     }
 
     @objc func copyAlias(_ s: NSMenuItem) {
