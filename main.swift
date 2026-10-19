@@ -7,6 +7,8 @@ let zshrc = home + "/.zshrc"
 let beginMark = "# >>> claude accounts >>>"
 let endMark = "# <<< claude accounts <<<"
 
+// MARK: Profiles — zsh aliases that start claude with their own CLAUDE_CONFIG_DIR.
+
 struct Profile {
     let alias: String
     let dir: String
@@ -274,6 +276,8 @@ func dot(_ color: NSColor, symbol: String = "circle.fill") -> NSImage? {
         .withSymbolConfiguration(.init(paletteColors: [color]))
 }
 
+// MARK: Terminal, notifications and settings
+
 func runInTerminal(_ command: String, title: String) {
     if FileManager.default.fileExists(atPath: "/Applications/Warp.app") {
         let dir = home + "/.warp/launch_configurations"
@@ -339,6 +343,8 @@ func claudeIcon() -> NSImage? {
     return img
 }
 
+// MARK: App
+
 final class HeaderBanner: NSView {
     let logo = NSImageView()
     let title = NSTextField(labelWithString: "Claude Profiles")
@@ -383,7 +389,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     // Live rows while the menu is open, so a refresh updates them in place instead of rebuilding
     // the menu (which would close any submenu under the pointer).
     var rows: [String: (row: NSMenuItem, profile: Profile)] = [:]
-    var header = NSMenuItem()
 
     func applicationDidFinishLaunching(_ n: Notification) {
         UNUserNotificationCenter.current().delegate = self
@@ -482,8 +487,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
 
     func build(_ menu: NSMenu) {
         menu.removeAllItems()
-        header = headerItem()
-        menu.addItem(header)
+        menu.addItem(headerItem())
         menu.addItem(.separator())
         menu.addItem(action("Add Profile", #selector(add), nil))
         let config = NSMenu()
