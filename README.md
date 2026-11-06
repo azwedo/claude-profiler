@@ -12,12 +12,12 @@ claude-personal  # signed in as you@gmail.com
 ## Features
 
 - **Profiles from the menu bar**: add, edit, copy or remove profiles without touching `~/.zshrc` by hand.
-- **Live usage**: session and weekly limits for every signed-in profile, the same numbers `/usage` shows, checked every 5 minutes per account, backing off if the service rate-limits. **Refresh** checks all accounts right away, at most once a minute.
-- **Colour-coded status**: green, orange or red dot per profile, with usage bars in each profile's submenu.
-- **Notifications**: when a limit passes 80%, hits 100%, or resets, and when a profile gets signed out.
+- **Live usage**: session and weekly limits for every signed-in profile, the same numbers `/usage` shows, with reset times in each profile's submenu, checked every 5 minutes per account. Each row's description line shows the session and weekly percentages, backing off if the service rate-limits.
+- **Sign-in and plan**: each row shows the login Claude Code reports and the plan (such as Ultra, Max 20x or Team). A profile that isn't logged in shows Not logged in (or Login expired if its sign-in lapsed), with a red dot and a Log In action in its submenu. Sign-in is checked on every menu open and every 5 minutes.
+- **Status dot**: green when signed in and usage is current, orange when signed in but usage can't be fetched right now, red when signed out or the sign-in expired, gray while checking. Usage bars in each profile's submenu are coloured by how full each limit is.
+- **Notifications**: when a limit is approaching 80%, reaches 100%, or resets, and when a profile is logged out or logged in again. Each one names the login and plan, and limit alerts include the reset time. Turn them off, or show their details, in System Settings → Notifications → Claude Profiler.
 - **One-click login**: Log In opens a terminal tab (Warp or Terminal) running `claude auth login` for that profile.
 - **Display names**: give a profile a friendly name in the menu, separate from the alias you type.
-- **Configuration**: show or hide emails, usage, aliases, logged-out profiles, the default profile and notifications.
 
 ## Requirements
 
@@ -50,8 +50,8 @@ New profiles copy your default profile's instructions and settings (`~/.claude/*
 ## How it works
 
 - **Profiles** are aliases of the form `alias claude-work='CLAUDE_CONFIG_DIR=$HOME/.claude-work claude'`, kept between `# >>> claude accounts >>>` and `# <<< claude accounts <<<` in `~/.zshrc`. Claude Profiler creates that block the first time you add a profile.
-- **The default profile** is plain `claude` using `~/.claude`. It appears if that folder exists, and can be hidden under Configuration.
-- **Usage** comes from the same endpoint Claude Code's `/usage` uses, called with each profile's own login, which Claude Code stores in the macOS keychain. Claude Profiler only reads that login; it never refreshes or changes it. A profile you haven't used for about 8 hours shows as idle until you run it again.
+- **The default profile** is plain `claude` using `~/.claude`. It appears if that folder exists. Removing it from the menu hides it until you run `defaults write com.azwedo.claude-profiler hideDefaultProfile -bool NO`.
+- **Usage** comes from the same endpoint Claude Code's `/usage` uses, called with each profile's own login, which Claude Code stores in the macOS keychain. When a login's access token expires, Claude Profiler asks Claude Code to renew it by running `/usage`, which makes no model call and costs no tokens. A login Claude Code reports as gone shows Not logged in, with a Log In action.
 - **Renaming an alias** keeps its folder, so the login stays valid.
 - **Settings** are stored with `defaults` under `com.azwedo.claude-profiler`.
 

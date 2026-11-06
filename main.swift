@@ -17,12 +17,76 @@ struct Profile {
     var name: String { displayName ?? (isDefault ? "claude (default)" : alias) }
     // The default profile keeps its account file at ~/.claude.json, outside ~/.claude.
     var accountFile: String { isDefault ? home + "/.claude.json" : dir + "/.claude.json" }
-    var email: String? {
+    // The signed-in account as Claude Code recorded it in the account file.
+    var account: [String: Any]? {
         guard let data = FileManager.default.contents(atPath: accountFile),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let account = json["oauthAccount"] as? [String: Any] else { return nil }
-        return account["emailAddress"] as? String
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        return json["oauthAccount"] as? [String: Any]
     }
+    var email: String? { account?["emailAddress"] as? String }
+    // Plan name such as "Max" or "Ultra". The keychain login can't tell Ultra from Max, so this is the signal.
+    var plan: String? { account?["planDisplayName"] as? String }
+}
+
+// Plans whose accounts have no session limit, so the menu never shows one for them.
+let sessionlessPlans: Set<String> = ["Ultra"]
+
+// Real sign-in state from `claude auth status --json`: whether Claude Code considers the profile logged in,
+// and whose login it is.
+enum SignIn {
+    case unknown                                    // the check itself failed
+    case signedOut
+    case signedIn(email: String?, planTier: String?, subscriptionType: String?)
+}
+
+// A login shell puts `claude` on PATH, which a menu bar app doesn't get by default.
+func claudeProcess(_ p: Profile, _ args: String) -> Process {
+    let task = Process()
+    task.executableURL = URL(fileURLWithPath: "/bin/zsh")
+    let config = p.isDefault ? "unset CLAUDE_CONFIG_DIR; " : "CLAUDE_CONFIG_DIR=\(shellQuote(p.dir)) "
+    task.arguments = ["-lc", config + "command claude " + args]
+    task.standardInput = FileHandle.nullDevice
+    task.standardError = FileHandle.nullDevice
+    return task
+}
+
+// Asks Claude Code whether the profile is signed in. This only reads, it doesn't refresh anything.
+func checkSignIn(_ p: Profile) -> SignIn {
+    let task = claudeProcess(p, "auth status --json")
+    let pipe = Pipe()
+    task.standardOutput = pipe
+    guard (try? task.run()) != nil else { return .unknown }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    task.waitUntilExit()
+    guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let loggedIn = json["loggedIn"] as? Bool else { return .unknown }
+    guard loggedIn else { return .signedOut }
+    return .signedIn(email: json["email"] as? String, planTier: json["planTier"] as? String,
+                     subscriptionType: json["subscriptionType"] as? String)
+}
+
+func fetchSignIn(_ p: Profile, done: @escaping (SignIn) -> Void) {
+    DispatchQueue.global().async { done(checkSignIn(p)) }
+}
+
+// Renews an expired login. Claude Code refreshes its token on its next request, and `/usage` is answered
+// without a model call, so this costs no tokens. Its output is discarded; the new token is read afterwards.
+func renewLogin(_ p: Profile) {
+    let task = claudeProcess(p, "-p '/usage' --output-format json --no-session-persistence")
+    task.standardOutput = FileHandle.nullDevice
+    guard (try? task.run()) != nil else { return }
+    task.waitUntilExit()
+}
+
+// The plan name: Claude Code's own name from the account file (e.g. "Ultra"), else the tier (e.g. "Max 20x")
+// or the subscription (e.g. "Team").
+func planName(_ p: Profile, _ sign: SignIn?) -> String? {
+    if let name = p.plan { return name }
+    guard case .signedIn(_, let tier, let subscription)? = sign else { return nil }
+    if let tier, tier.hasPrefix("max_"), tier.hasSuffix("x") {
+        return "Max " + String(tier.dropFirst(4).dropLast()) + "x"
+    }
+    return subscription.map { $0.capitalized }
 }
 
 func loadProfiles() -> [Profile] {
@@ -158,7 +222,7 @@ func keychainService(_ p: Profile) -> String {
     return "Claude Code-credentials-" + hex.prefix(8)
 }
 
-let idleMessage = "idle — run it to refresh usage"
+let expiredMessage = "access token expired"
 let signedOutMessage = "signed out"
 let rateLimitedMessage = "rate limited"
 
@@ -174,9 +238,9 @@ func accessToken(_ p: Profile) -> Result<String, String> {
     guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
           let oauth = json["claudeAiOauth"] as? [String: Any],
           let token = oauth["accessToken"] as? String else { return .failure(signedOutMessage) }
-    // Refreshing here would rotate the token out from under Claude Code, so leave that to it.
+    // This app never refreshes the token itself; renewLogin asks Claude Code to do it.
     if let exp = oauth["expiresAt"] as? Double, exp / 1000 < Date().timeIntervalSince1970 {
-        return .failure(idleMessage)
+        return .failure(expiredMessage)
     }
     return .success(token)
 }
@@ -219,6 +283,16 @@ func fetchUsage(_ p: Profile, done: @escaping (UsageState) -> Void) {
         let token: String
         switch accessToken(p) {
         case .success(let t): token = t
+        case .failure(expiredMessage):
+            renewLogin(p)
+            switch accessToken(p) {
+            case .success(let t): token = t
+            case .failure:
+                // Still no valid token. Only a login Claude Code reports as gone counts as signed out;
+                // otherwise keep the last numbers and try again on the next round.
+                if case .signedOut = checkSignIn(p) { return done(.signedOut) }
+                return done(.failed("sign-in not renewed yet, retrying"))
+            }
         case .failure(let msg): return done(msg == signedOutMessage ? .signedOut : .failed(msg))
         }
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!, timeoutInterval: 15)
@@ -245,19 +319,27 @@ func severityColor(_ s: String) -> NSColor {
     }
 }
 
-func severityRank(_ s: String) -> Int { ["normal": 0, "warning": 1][s] ?? 2 }
-
+// "resets Thu 12 Nov 14:00" in this Mac's time zone, or "resetting" once the time has passed.
 func resetText(_ d: Date?) -> String {
     guard let d else { return "" }
-    let secs = Int(d.timeIntervalSinceNow)
-    if secs <= 0 { return "resetting" }
-    if secs < 86400 {
-        let h = secs / 3600, m = secs % 3600 / 60
-        return "resets in " + (h > 0 ? "\(h)h \(m)m" : "\(m)m")
-    }
+    if d.timeIntervalSinceNow <= 0 { return "resetting" }
     let f = DateFormatter()
-    f.dateFormat = "EEE HH:mm"
+    f.dateFormat = "EEE d MMM HH:mm"
     return "resets " + f.string(from: d)
+}
+
+// "in 2h 15m" for a reset within the next day, so the submenu can show the clock time and the countdown.
+func countdownText(_ d: Date?) -> String {
+    guard let d else { return "" }
+    let secs = Int(d.timeIntervalSinceNow)
+    guard secs > 0, secs < 86400 else { return "" }
+    let h = secs / 3600, m = secs % 3600 / 60
+    return "in " + (h > 0 ? "\(h)h \(m)m" : "\(m)m")
+}
+
+// Short name for a limit in the menu: "Week", "Sess", "Week · Opus".
+func shortLabel(_ l: Limit) -> String {
+    l.label.replacingOccurrences(of: "Weekly", with: "Week").replacingOccurrences(of: "Session", with: "Sess")
 }
 
 // "Session  ▰▰▰▱▱▱▱▱▱▱  26%  resets in 24m", with the bar and percent in the severity colour.
@@ -270,7 +352,8 @@ func limitTitle(_ l: Limit) -> NSAttributedString {
     out.append(NSAttributedString(string: String(repeating: "▰", count: filled), attributes: [.font: mono, .foregroundColor: color]))
     out.append(NSAttributedString(string: String(repeating: "▱", count: 10 - filled), attributes: [.font: mono, .foregroundColor: NSColor.tertiaryLabelColor]))
     out.append(NSAttributedString(string: String(format: " %3d%%", l.percent), attributes: [.font: mono, .foregroundColor: color]))
-    out.append(NSAttributedString(string: "  " + resetText(l.resetsAt), attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor]))
+    let reset = [resetText(l.resetsAt), countdownText(l.resetsAt)].filter { !$0.isEmpty }.joined(separator: " · ")
+    out.append(NSAttributedString(string: "  " + reset, attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor]))
     return out
 }
 
@@ -308,28 +391,7 @@ func loginCommand(_ p: Profile) -> String {
     (p.isDefault ? "unset CLAUDE_CONFIG_DIR; " : "CLAUDE_CONFIG_DIR=\(shellQuote(p.dir)) ") + "claude auth login"
 }
 
-// Display preferences, toggled from the Configuration submenu.
-let settings: [(key: String, title: String, on: Bool)] = [
-    ("showEmail", "Show Email", true),
-    ("showUsage", "Show Usage in List", true),
-    ("showAlias", "Show Alias Next to Display Name", false),
-    ("showLoggedOut", "Show Logged-Out Profiles", true),
-    ("showDefault", "Show Default Profile", true),
-    ("notifications", "Notifications", true),
-]
-
-func setting(_ key: String) -> Bool {
-    if key == "showDefault" { return !UserDefaults.standard.bool(forKey: hideDefaultKey) }
-    return UserDefaults.standard.object(forKey: key) as? Bool ?? settings.first { $0.key == key }?.on ?? true
-}
-
-func setSetting(_ key: String, _ on: Bool) {
-    if key == "showDefault" { UserDefaults.standard.set(!on, forKey: hideDefaultKey) }
-    else { UserDefaults.standard.set(on, forKey: key) }
-}
-
 func notify(_ title: String, _ body: String) {
-    guard setting("notifications") else { return }
     let c = UNMutableNotificationContent()
     c.title = title
     c.body = body
@@ -348,51 +410,17 @@ func claudeIcon() -> NSImage? {
 
 // MARK: App
 
-final class HeaderBanner: NSView {
-    let logo = NSImageView()
-    let title = NSTextField(labelWithString: "Claude Profiles")
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        logo.image = claudeIcon().map { img in
-            let big = img.copy() as! NSImage
-            big.size = NSSize(width: 18, height: 18)
-            return big
-        }
-        logo.contentTintColor = .white
-        title.font = .systemFont(ofSize: 14, weight: .bold)
-        title.textColor = .white
-        for v in [logo, title] { v.translatesAutoresizingMaskIntoConstraints = false; addSubview(v) }
-        NSLayoutConstraint.activate([
-            logo.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
-            logo.centerYAnchor.constraint(equalTo: centerYAnchor),
-            logo.widthAnchor.constraint(equalToConstant: 18),
-            logo.heightAnchor.constraint(equalToConstant: 18),
-            title.leadingAnchor.constraint(equalTo: logo.trailingAnchor, constant: 8),
-            title.centerYAnchor.constraint(equalTo: centerYAnchor),
-        ])
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    override func draw(_ dirty: NSRect) {
-        let card = NSBezierPath(roundedRect: bounds.insetBy(dx: 6, dy: 4), xRadius: 8, yRadius: 8)
-        NSGradient(starting: NSColor(srgbRed: 0.851, green: 0.467, blue: 0.341, alpha: 1),   // #D97757
-                   ending: NSColor(srgbRed: 0.722, green: 0.341, blue: 0.239, alpha: 1))?    // deeper terracotta
-            .draw(in: card, angle: -20)
-    }
-}
-
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
     var usage: [String: UsageState] = [:]   // keyed by profile dir
+    var auth: [String: SignIn] = [:]        // keyed by profile dir; missing until first checked
+    var nextAuth: [String: Date] = [:]
     // Per-profile schedule. The usage endpoint rate-limits per account (and Claude Code's own /usage
     // shares that budget), so each profile is checked every 5 minutes and backs off after a 429.
     var nextFetch: [String: Date] = [:]
     var backoff: [String: TimeInterval] = [:]
     let interval: TimeInterval = 300
-    var lastManualRefresh = Date.distantPast
     var menuOpen = false
     // Live rows while the menu is open, so a refresh updates them in place instead of rebuilding
     // the menu (which would close any submenu under the pointer).
@@ -418,12 +446,17 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
 
     func allProfiles() -> [Profile] { (showsDefault ? [defaultProfile] : []) + loadProfiles() }
 
-    // Runs every minute; fetches only the profiles that are due.
+    // Runs every minute; checks sign-in and fetches usage only for the profiles that are due.
     func refreshUsage() {
         let profiles = allProfiles()
         let live = Set(profiles.map(\.dir))
         usage = usage.filter { live.contains($0.key) }
+        auth = auth.filter { live.contains($0.key) }
         let now = Date()
+        for p in profiles where (nextAuth[p.dir] ?? .distantPast) <= now {
+            nextAuth[p.dir] = now + interval
+            fetchSignIn(p) { state in DispatchQueue.main.async { self.applySignIn(state, to: p) } }
+        }
         for p in profiles where p.email != nil && (nextFetch[p.dir] ?? .distantPast) <= now {
             nextFetch[p.dir] = now + interval
             fetchUsage(p) { state in
@@ -432,8 +465,19 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         }
     }
 
+    func applySignIn(_ state: SignIn, to p: Profile) {
+        auth[p.dir] = state
+        if case .signedOut = state { checkAlerts(p, .signedOut) }
+        if case .signedIn = state { announceSignedIn(p) }
+        if menuOpen, let live = rows[p.dir] { fill(live.row, live.profile) }
+    }
+
     func apply(_ state: UsageState, to p: Profile) {
         var state = state
+        // Plans without a session limit never show one, even if the usage endpoint sends it.
+        if case .loaded(let limits) = state, sessionlessPlans.contains(p.plan ?? "") {
+            state = .loaded(limits.filter { $0.label != "Session" })
+        }
         if case .failed(rateLimitedMessage) = state {
             let wait = min((backoff[p.dir] ?? interval) * 2, 1800)
             backoff[p.dir] = wait
@@ -445,7 +489,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             backoff[p.dir] = nil
         }
         // A failed refresh keeps the last good numbers instead of wiping them.
-        if case .failed(let msg) = state, msg != idleMessage, case .loaded? = usage[p.dir] { return }
+        if case .failed = state, case .loaded? = usage[p.dir] { return }
         checkAlerts(p, state)
         usage[p.dir] = state
         if menuOpen, let live = rows[p.dir] {
@@ -453,30 +497,58 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         }
     }
 
-    // MARK: Notifications — crossing 80%, hitting a limit, a limit resetting, getting signed out.
+    // MARK: Notifications — approaching 80%, hitting a limit, a limit resetting, logging out, logging back in.
     // Last-seen values persist so a restart neither repeats nor misses an alert.
+
+    // Who an alert is about: the login and plan, so alerts from several accounts can be told apart.
+    func accountLine(_ p: Profile) -> String {
+        [p.email, planName(p, auth[p.dir])].compactMap { $0 }.joined(separator: " · ")
+    }
+
+    // "Resets Thu 12 Nov 14:00", capitalised for the start of a sentence.
+    func resetSentence(_ l: Limit) -> String {
+        let text = resetText(l.resetsAt)
+        return text.prefix(1).uppercased() + text.dropFirst()
+    }
+
+    // A profile that was logged out and is logged in again says so, once.
+    func announceSignedIn(_ p: Profile) {
+        let d = UserDefaults.standard
+        var out = Set(d.stringArray(forKey: "signedOutNotified") ?? [])
+        guard out.remove(p.dir) != nil else { return }
+        d.set(Array(out), forKey: "signedOutNotified")
+        notifyLoggedIn(p)
+    }
+
+    func notifyLoggedIn(_ p: Profile) {
+        notify("\(p.name) is logged in", "\(accountLine(p)). Usage is tracked again.")
+    }
 
     func checkAlerts(_ p: Profile, _ state: UsageState) {
         let d = UserDefaults.standard
         var seen = d.dictionary(forKey: "seenPercent") as? [String: Int] ?? [:]
         var out = Set(d.stringArray(forKey: "signedOutNotified") ?? [])
         let name = p.name
+        let account = accountLine(p)
         switch state {
         case .signedOut:
-            if out.insert(p.dir).inserted { notify("\(name) is signed out", "Open Claude Profiler and choose Log In to fix it.") }
+            if out.insert(p.dir).inserted {
+                notify("\(name) is logged out", "\(account). Choose Log In from the menu to sign in again.")
+            }
         case .loaded(let limits):
-            out.remove(p.dir)
+            // Usage arriving means the login works again, so a profile that was logged out is back.
+            if out.remove(p.dir) != nil { notifyLoggedIn(p) }
             for l in limits {
                 let key = p.dir + "|" + l.label
                 defer { seen[key] = l.percent }
                 guard let prev = seen[key] else { continue }
-                let reset = resetText(l.resetsAt)
+                let short = shortLabel(l)
                 if prev < 100 && l.percent >= 100 {
-                    notify("\(name) hit its \(l.label) limit", reset.isEmpty ? "" : reset.prefix(1).uppercased() + reset.dropFirst())
+                    notify("\(name): \(short) limit reached", "\(account). \(resetSentence(l)).")
                 } else if prev < 80 && l.percent >= 80 {
-                    notify("\(name): \(l.label) at \(l.percent)%", reset.isEmpty ? "" : reset.prefix(1).uppercased() + reset.dropFirst())
+                    notify("\(name): \(short) at \(l.percent)%", "Approaching the limit. \(account). \(resetSentence(l)).")
                 } else if prev >= 80 && l.percent < 80 && l.percent < prev {
-                    notify("\(name): \(l.label) limit reset", "Now at \(l.percent)%.")
+                    notify("\(name): \(short) limit reset", "Now at \(l.percent)%. \(account). \(resetSentence(l)).")
                 }
             }
         case .failed:
@@ -490,55 +562,32 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
 
     func menuWillOpen(_ menu: NSMenu) {
         menuOpen = true
+        // Check sign-in again on every open, so the rows show what is true now.
+        nextAuth = [:]
+        refreshUsage()
     }
 
     func menuDidClose(_ menu: NSMenu) { menuOpen = false }
 
     func menuNeedsUpdate(_ menu: NSMenu) { build(menu) }
 
-    // A rounded banner in Claude's orange gradient, so the title reads as a header rather than another item.
-    func headerItem() -> NSMenuItem {
-        let banner = HeaderBanner(frame: NSRect(x: 0, y: 0, width: 260, height: 46))
-        banner.autoresizingMask = .width
-        let item = NSMenuItem()
-        item.view = banner
-        return item
-    }
-
     func build(_ menu: NSMenu) {
         menu.removeAllItems()
-        menu.addItem(headerItem())
-        menu.addItem(.separator())
-        // Manual refresh, at most once a minute so it can't trip the rate limit on its own.
-        let wait = Int(60 - Date().timeIntervalSince(lastManualRefresh))
-        let refresh = action(wait > 0 ? "Refresh (available in \(wait)s)" : "Refresh", #selector(refreshNow), nil)
-        refresh.isEnabled = wait <= 0
         menu.autoenablesItems = false
-        menu.addItem(refresh)
         menu.addItem(action("Add Profile", #selector(add), nil))
-        let config = NSMenu()
-        for s in settings {
-            let i = action(s.title, #selector(toggleSetting), s.key)
-            i.state = setting(s.key) ? .on : .off
-            config.addItem(i)
-        }
-        let configItem = NSMenuItem(title: "Configuration", action: nil, keyEquivalent: "")
-        configItem.submenu = config
-        menu.addItem(configItem)
         insertRows()
     }
 
-    // Profile rows sit between the header and the first separator, so a usage refresh can swap
-    // just them without closing an open submenu.
+    // Profile rows sit above the first separator, so a usage refresh can swap just them without
+    // closing an open submenu.
     func insertRows() {
         for (row, _) in rows.values where menu.index(of: row) >= 0 { menu.removeItem(row) }
         rows = [:]
-        var index = 1
-        let visible = allProfiles().filter { $0.email != nil || setting("showLoggedOut") }
+        var index = 0
+        let visible = allProfiles()
         if visible.isEmpty {
             let empty = NSMenuItem(title: "No profiles yet", action: nil, keyEquivalent: "")
-            empty.subtitle = allProfiles().isEmpty ? "Add a profile to sign in to another Claude account"
-                                                   : "Logged-out profiles are hidden in Configuration"
+            empty.subtitle = "Add a profile to sign in to another Claude account"
             empty.image = NSImage(systemSymbolName: "person.crop.circle.badge.plus", accessibilityDescription: nil)
             empty.isEnabled = false
             rows["empty"] = (empty, defaultProfile)
@@ -546,13 +595,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
         }
         for p in visible {
             let row = NSMenuItem(title: p.name, action: nil, keyEquivalent: "")
-            // With a display name set, optionally show the alias after it in grey.
-            if p.displayName != nil && setting("showAlias") {
-                let t = NSMutableAttributedString(string: p.name, attributes: [.font: NSFont.menuFont(ofSize: 0)])
-                t.append(NSAttributedString(string: "  " + p.alias, attributes: [
-                    .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize), .foregroundColor: NSColor.secondaryLabelColor]))
-                row.attributedTitle = t
-            }
             row.submenu = NSMenu()
             row.submenu?.autoenablesItems = false
             fill(row, p)
@@ -560,46 +602,67 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             menu.insertItem(row, at: index)
             index += 1
         }
+        menu.insertItem(.separator(), at: index)
     }
 
-    // Sets a row's status line and dot, and refills its submenu (the same NSMenu, so an open one stays open).
+    // Sets a row's lines and dot, and refills its submenu (the same NSMenu, so an open one stays open).
+    // The subtitle reads login · plan · usage. A login that isn't valid shows Not logged in or Login expired, with a Log In action.
     func fill(_ row: NSMenuItem, _ p: Profile) {
         let sub = row.submenu!
         sub.removeAllItems()
+        // The alias is the command you type. The row shows the display name, so the alias goes here.
+        let aliasLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        aliasLine.attributedTitle = NSAttributedString(string: "alias " + p.alias, attributes: [
+            .font: NSFont.menuFont(ofSize: NSFont.smallSystemFontSize), .foregroundColor: NSColor.secondaryLabelColor])
+        aliasLine.isEnabled = false
+        sub.addItem(aliasLine)
+        sub.addItem(.separator())
         var needsLogin = false
-        // The status line is built from parts so each one can be switched off in Settings.
-        let email = setting("showEmail") ? p.email : nil
+        var login: String?
+        var plan: String?
         var status: [String] = []
-        switch (p.email, usage[p.dir]) {
-        case (nil, _):
-            status = ["Not logged in"]
-            row.image = NSImage(systemSymbolName: "circle.dashed", accessibilityDescription: nil)
-            needsLogin = true
-        case (_, .signedOut?):
-            status = ["signed out — log in again"]
+        var error: String?
+        switch auth[p.dir] {
+        case nil:
+            status = ["checking sign-in…"]
+            row.image = dot(.systemGray)
+        case .unknown?:
+            status = ["couldn't check sign-in"]
+            row.image = dot(.systemOrange, symbol: "exclamationmark.circle.fill")
+        case .signedOut?:
+            error = "Not logged in"
             row.image = dot(.systemRed, symbol: "xmark.circle.fill")
             needsLogin = true
-        case (_, .loaded(let limits)?):
-            if setting("showUsage") {
+        case .signedIn(let email, _, _)?:
+            login = email ?? p.email
+            plan = planName(p, auth[p.dir])
+            switch usage[p.dir] {
+            case .signedOut?:
+                error = "Login expired"
+                row.image = dot(.systemRed, symbol: "xmark.circle.fill")
+                needsLogin = true
+            case .loaded(let limits)?:
+                // The dot is about the account, not how full the limits are; the bars below show that.
+                row.image = dot(.systemGreen)
+                // The description line carries the usage: "Week 85% · Sess 21%".
                 status = limits.filter { !$0.label.hasPrefix("Weekly · ") || $0.percent > 0 }
-                    .map { "\($0.label.replacingOccurrences(of: "Weekly", with: "Week").replacingOccurrences(of: "Session", with: "Sess")) \($0.percent)%" }
+                    .map { "\(shortLabel($0)) \($0.percent)%" }
+                for l in limits {
+                    let info = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+                    info.attributedTitle = limitTitle(l)
+                    sub.addItem(info)
+                }
+                sub.addItem(.separator())
+            case .failed(let msg)?:
+                status = [msg]
+                row.image = dot(.systemOrange, symbol: "exclamationmark.circle.fill")
+            case nil:
+                status = ["loading usage"]
+                row.image = dot(.systemGray)
             }
-            let worst = limits.max { severityRank($0.severity) < severityRank($1.severity) }?.severity ?? "normal"
-            row.image = dot(severityColor(worst))
-            for l in limits {
-                let info = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-                info.attributedTitle = limitTitle(l)
-                sub.addItem(info)
-            }
-            sub.addItem(.separator())
-        case (_, .failed(let msg)?):
-            status = [msg]
-            row.image = dot(.systemGray, symbol: "exclamationmark.circle.fill")
-        case (_, nil):
-            if setting("showUsage") { status = ["loading usage"] }
-            row.image = dot(.systemGray)
         }
-        let line = ([email].compactMap { $0 } + status).joined(separator: " · ")
+        let parts = [login, plan].compactMap { $0 } + (error.map { [$0] } ?? status)
+        let line = parts.joined(separator: " · ")
         row.subtitle = line.isEmpty ? nil : line
         if needsLogin { sub.addItem(action("Log In", #selector(logIn), p)) }
         sub.addItem(action("Copy", #selector(copyAlias), p))
@@ -616,17 +679,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
 
     func fail(_ msg: String) { let e = NSAlert(); e.messageText = "Claude Profiler"; e.informativeText = msg; e.runModal() }
 
-    @objc func refreshNow(_ s: NSMenuItem) {
-        lastManualRefresh = Date()
-        nextFetch = [:]
-        refreshUsage()
-    }
-
-    @objc func toggleSetting(_ s: NSMenuItem) {
-        let key = s.representedObject as! String
-        setSetting(key, !setting(key))
-    }
-
     @objc func copyAlias(_ s: NSMenuItem) {
         copyToClipboard((s.representedObject as! Profile).alias + " --dangerously-skip-permissions")
     }
@@ -638,7 +690,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
     @objc func logOut(_ s: NSMenuItem) {
         let alert = NSAlert()
         alert.messageText = "Remove the default claude profile?"
-        alert.informativeText = "Signs \((s.representedObject as! Profile).email ?? "it") out of plain claude and hides it from this menu (Configuration → Show Default Profile brings it back). Claude Code itself stays installed.\n\nTick the box to also move ~/.claude and ~/.claude.json (settings, skills, memory, history — the template new profiles copy from) to the Trash."
+        alert.informativeText = "Signs \((s.representedObject as! Profile).email ?? "it") out of plain claude and hides it from this menu (to bring it back: defaults write com.azwedo.claude-profiler hideDefaultProfile -bool NO). Claude Code itself stays installed.\n\nTick the box to also move ~/.claude and ~/.claude.json (settings, skills, memory, history — the template new profiles copy from) to the Trash."
         let box = NSButton(checkboxWithTitle: "Also move ~/.claude to Trash", target: nil, action: nil)
         alert.accessoryView = box
         alert.addButton(withTitle: "Remove")
@@ -655,7 +707,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotifica
             }
         }
     }
-
 
     @objc func remove(_ s: NSMenuItem) {
         let p = s.representedObject as! Profile
